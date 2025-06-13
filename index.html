@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Esprssp L3任务完成情况</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<link rel="icon" href="favicon.ico">
+<style>
+:root{--blue:#0078d4;--blue-dark:#005fa3;--green:#28a745;--green-dark:#218838;
+      --bg:#f9f9f9;--card:#fff;--border:#e5e7eb;--txt:#222;--sub:#666;--err:#d92c2c}
+html,body{margin:0;padding:0;height:100%}
+body{font-family:-apple-system,Segoe UI,PingFang SC,Helvetica,Arial,sans-serif;
+     background:var(--bg);color:var(--txt);display:flex;flex-direction:column;align-items:center;padding:26px 16px}
+h1{margin:0 0 14px;font-size:26px;color:var(--blue)}
+#portal{display:inline-block;padding:8px 18px;border-radius:8px;background:var(--blue);
+        color:#fff;text-decoration:none;font-size:15px;margin-bottom:4px}
+#portal:hover{background:var(--blue-dark)}
+#duration{font-size:13px;color:var(--sub);margin-bottom:18px}
+.input-wrap{width:100%;max-width:780px;background:var(--card);border:1px solid var(--border);
+            border-radius:12px;padding:20px;box-shadow:0 4px 8px rgba(0,0,0,.04);
+            display:flex;flex-wrap:wrap;gap:12px}
+textarea{flex:1 1 100%;height:140px;resize:vertical;font:14px/1.4 Menlo,Consolas,monospace;
+         padding:10px;border:2px solid var(--border);border-radius:8px}
+.btn{color:#fff;padding:9px 26px;border:none;border-radius:8px;font-size:15px;cursor:pointer;transition:.18s}
+.btn-green{background:var(--green)} .btn-green:hover{background:var(--green-dark)}
+.btn-blue{background:var(--blue)} .btn-blue:hover{background:var(--blue-dark)}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+#pgBox{position:sticky;top:0;left:0;width:100%;z-index:20;background:var(--bg);padding-bottom:6px}
+progress{width:100%;height:6px;appearance:none;accent-color:var(--blue)}
+progress::-webkit-progress-bar{background:#e5e7eb;border-radius:3px}
+progress::-webkit-progress-value{border-radius:3px}
+.action{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+#sum{font-size:14px;color:var(--sub)}
+#tabs{display:flex;gap:8px;margin-top:12px}
+.tab{padding:4px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;cursor:pointer}
+.tab.active{background:var(--blue);color:#fff;border-color:var(--blue)}
+table{width:100%;max-width:780px;border-collapse:collapse;margin-top:10px;background:var(--card);
+      border-radius:10px;overflow:hidden}
+th,td{padding:10px 14px;border-bottom:1px solid var(--border);font-size:14px;text-align:left}
+th{background:#f0f4ff;font-weight:600;cursor:pointer}
+tbody tr:last-child td{border-bottom:none}
+.highlight{background:rgba(40,167,69,.12)}
+.error{color:var(--err)}
+.pbar{width:100%;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden}
+.pbar>div{height:100%;background:var(--green)}
+.hidden{display:none}
+@media(max-width:560px){.btn{flex:1 1 auto}}
+</style>
+</head>
+<body>
+<h1>Esprssp L3任务完成情况</h1>
+<a id="portal" href="https://app.layer3.xyz/campaigns/brewing-the-future" target="_blank">任务传送门 ↗</a>
+<div id="duration">活动时间：5 月 14 日 11:00 至 6 月 26 日 11:00（美东）</div>
+
+<div id="pgBox" style="display:none"><progress id="pg" value="0" max="0"></progress></div>
+
+<div class="input-wrap">
+  <textarea id="addrInput" placeholder="一行一个钱包地址 (0x…)"></textarea>
+  <button id="queryBtn" class="btn btn-green">开始查询</button>
+</div>
+
+<div class="action">
+  <div id="sum"></div>
+  <button id="copyBtn" class="btn btn-blue" style="display:none">复制已完成地址</button>
+</div>
+
+<div id="tabs" style="display:none">
+  <div class="tab active" data-filter="all">全部</div>
+  <div class="tab" data-filter="done">已完成</div>
+  <div class="tab" data-filter="todo">未完成</div>
+</div>
+
+<table style="display:none">
+  <thead>
+    <tr>
+      <th style="width:48px;">#</th>
+      <th style="width:248px;">地址</th>
+      <th id="sortDone" style="width:120px;">完成任务数量 ▴</th>
+      <th style="width:120px;">待完成任务</th>
+      <th>进度</th>
+    </tr>
+  </thead>
+  <tbody id="tbody"></tbody>
+</table>
+
+<script>
+const RPC="https://arb1.arbitrum.io/rpc";
+const TOKEN="0x1195cf65f83b3a5768f3c496d3a05ad6412c64b7";
+const SELECTOR="0x70a08231";
+const THRESHOLD=8;
+const BATCH=10;                    // ← 每批 10 个地址
+
+const $=id=>document.getElementById(id);
+const ta=$("addrInput"),btn=$("queryBtn"),pg=$("pg"),pgBox=$("pgBox"),
+      sum=$("sum"),tbody=$("tbody"),table=tbody.parentElement,
+      copyBtn=$("copyBtn"),tabs=$("tabs"),sortTh=$("sortDone");
+
+const addrRe=/^0x[a-fA-F0-9]{40}$/;
+const pad64=h=>h.replace(/^0x/,"").padStart(64,"0");
+const rpc=body=>fetch(RPC,{method:"POST",headers:{"Content-Type":"application/json"},body})
+                .then(r=>r.ok?r.json():Promise.reject(`HTTP ${r.status}`));
+
+/* tab 过滤 */
+tabs.addEventListener("click",e=>{
+  if(!e.target.classList.contains("tab"))return;
+  [...tabs.children].forEach(t=>t.classList.remove("active"));
+  e.target.classList.add("active");
+  const f=e.target.dataset.filter;
+  for(const tr of tbody.rows){
+    const done=tr.classList.contains("done");
+    tr.classList.toggle("hidden",f==="done"?!done:f==="todo"?done:false);
+  }
+});
+
+/* sort */
+let asc=true;
+sortTh.onclick=()=>{
+  const rows=[...tbody.rows].sort((a,b)=>{
+    const va=+a.dataset.balance||0, vb=+b.dataset.balance||0;
+    return asc?va-vb:vb-va;
+  });
+  asc=!asc; sortTh.textContent=`完成任务数量 ${asc?"▴":"▾"}`;
+  rows.forEach(r=>tbody.appendChild(r));
+};
+
+/* 查询 */
+btn.onclick=async()=>{
+  const valid=ta.value.trim().split(/\s+/).filter(a=>addrRe.test(a));
+  if(!valid.length){alert("请输入至少一个有效地址");return;}
+
+  btn.disabled=true;tbody.innerHTML="";table.style.display="none";
+  tabs.style.display="none";copyBtn.style.display="none";sum.textContent="";
+  pgBox.style.display="";pg.max=valid.length;pg.value=0;
+
+  const finished=[];let idCtr=1;
+  for(let i=0;i<valid.length;i+=BATCH){
+    const chunk=valid.slice(i,i+BATCH);
+    const batch=chunk.map((addr,j)=>({
+      id:idCtr+j,jsonrpc:"2.0",method:"eth_call",
+      params:[{to:TOKEN,data:SELECTOR+pad64(addr)},"latest"]
+    }));
+    idCtr+=chunk.length;
+
+    let res=[];
+    try{res=await rpc(JSON.stringify(batch));}catch{}
+    const map=new Map(res.map(o=>[o.id,o.result]));
+
+    chunk.forEach((addr,idx)=>{
+      const id=idCtr-chunk.length+idx;
+      const bal=parseInt(map.get(id)||"0x0",16);
+      const done=bal>=THRESHOLD, todo=done?0:THRESHOLD-bal, pct=Math.min(bal/THRESHOLD,1)*100;
+      const tr=document.createElement("tr"); tr.dataset.balance=bal;
+      if(done){tr.classList.add("done","highlight");finished.push(addr);}
+      tr.innerHTML=`
+        <td>${tbody.rows.length+1}</td>
+        <td style="font-family:Menlo,Consolas,monospace">${addr}</td>
+        <td>${done?"完成":bal}</td>
+        <td>${done?"0":`还差 ${todo}`}</td>
+        <td><div class="pbar"><div style="width:${pct}%"></div></div></td>`;
+      tbody.appendChild(tr); pg.value++;
+    });
+  }
+
+  sum.textContent=`完成 ✔️｜地址 ${valid.length}｜已完成 ${finished.length}`;
+  pgBox.style.display="none";table.style.display="";tabs.style.display="flex";
+  if(finished.length){
+    copyBtn.style.display=""; copyBtn.onclick=()=>{
+      navigator.clipboard.writeText(finished.join("\n")).then(()=>{
+        const t=copyBtn.textContent; copyBtn.textContent="已复制！";
+        setTimeout(()=>copyBtn.textContent=t,1500);
+      });
+    };
+  }
+  btn.disabled=false;
+};
+</script>
+</body>
+</html>
