@@ -40,7 +40,6 @@ th,td{padding:10px 14px;border-bottom:1px solid var(--border);font-size:14px;tex
 th{background:#f0f4ff;font-weight:600;cursor:pointer}
 tbody tr:last-child td{border-bottom:none}
 .highlight{background:rgba(40,167,69,.12)}
-.error{color:var(--err)}
 .pbar{width:100%;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden}
 .pbar>div{height:100%;background:var(--green)}
 .hidden{display:none}
@@ -73,10 +72,10 @@ tbody tr:last-child td{border-bottom:none}
 <table style="display:none">
   <thead>
     <tr>
-      <th style="width:48px;">#</th>
-      <th style="width:248px;">地址</th>
-      <th id="sortDone" style="width:120px;">完成任务数量 ▴</th>
-      <th style="width:120px;">待完成任务</th>
+      <th style="width:46px;">#</th>
+      <th style="width:250px;">地址</th>
+      <th>完成任务数量</th>
+      <th>待完成任务</th>
       <th>进度</th>
     </tr>
   </thead>
@@ -84,24 +83,28 @@ tbody tr:last-child td{border-bottom:none}
 </table>
 
 <script>
+/* 固定配置 */
 const RPC="https://arb1.arbitrum.io/rpc";
 const TOKEN="0x1195cf65f83b3a5768f3c496d3a05ad6412c64b7";
 const SELECTOR="0x70a08231";
 const THRESHOLD=8;
-const BATCH=10;                    // ← 每批 10 个地址
+const GAP=500;                 // 每次查询间隔 500ms
 
+/* DOM */
 const $=id=>document.getElementById(id);
 const ta=$("addrInput"),btn=$("queryBtn"),pg=$("pg"),pgBox=$("pgBox"),
       sum=$("sum"),tbody=$("tbody"),table=tbody.parentElement,
-      copyBtn=$("copyBtn"),tabs=$("tabs"),sortTh=$("sortDone");
+      copyBtn=$("copyBtn"),tabs=$("tabs");
 
 const addrRe=/^0x[a-fA-F0-9]{40}$/;
-const pad64=h=>h.replace(/^0x/,"").padStart(64,"0");
+const pad64=s=>s.replace(/^0x/,"").padStart(64,"0");
 const rpc=body=>fetch(RPC,{method:"POST",headers:{"Content-Type":"application/json"},body})
-                .then(r=>r.ok?r.json():Promise.reject(`HTTP ${r.status}`));
+                .then(r=>r.ok?r.json():Promise.reject());
+
+let timer=null;
 
 /* tab 过滤 */
-tabs.addEventListener("click",e=>{
+tabs.onclick=e=>{
   if(!e.target.classList.contains("tab"))return;
   [...tabs.children].forEach(t=>t.classList.remove("active"));
   e.target.classList.add("active");
@@ -110,68 +113,62 @@ tabs.addEventListener("click",e=>{
     const done=tr.classList.contains("done");
     tr.classList.toggle("hidden",f==="done"?!done:f==="todo"?done:false);
   }
-});
-
-/* sort */
-let asc=true;
-sortTh.onclick=()=>{
-  const rows=[...tbody.rows].sort((a,b)=>{
-    const va=+a.dataset.balance||0, vb=+b.dataset.balance||0;
-    return asc?va-vb:vb-va;
-  });
-  asc=!asc; sortTh.textContent=`完成任务数量 ${asc?"▴":"▾"}`;
-  rows.forEach(r=>tbody.appendChild(r));
 };
 
-/* 查询 */
+/* 查询主逻辑 */
 btn.onclick=async()=>{
-  const valid=ta.value.trim().split(/\s+/).filter(a=>addrRe.test(a));
-  if(!valid.length){alert("请输入至少一个有效地址");return;}
+  clearInterval(timer);          // 若已有轮询先停掉
+  const addrs=ta.value.trim().split(/\s+/).filter(a=>addrRe.test(a));
+  if(!addrs.length){alert("请输入至少一个有效地址");return;}
 
+  /* UI reset */
   btn.disabled=true;tbody.innerHTML="";table.style.display="none";
-  tabs.style.display="none";copyBtn.style.display="none";sum.textContent="";
-  pgBox.style.display="";pg.max=valid.length;pg.value=0;
+  tabs.style.display="none";copyBtn.style.display="none";
+  pgBox.style.display="";pg.max=addrs.length;pg.value=0;
 
-  const finished=[];let idCtr=1;
-  for(let i=0;i<valid.length;i+=BATCH){
-    const chunk=valid.slice(i,i+BATCH);
-    const batch=chunk.map((addr,j)=>({
-      id:idCtr+j,jsonrpc:"2.0",method:"eth_call",
-      params:[{to:TOKEN,data:SELECTOR+pad64(addr)},"latest"]
-    }));
-    idCtr+=chunk.length;
+  let doneCnt=0, hasNFTcnt=0, finished=[], index=0;
 
-    let res=[];
-    try{res=await rpc(JSON.stringify(batch));}catch{}
-    const map=new Map(res.map(o=>[o.id,o.result]));
+  const updateSummary=()=>sum.textContent=
+    `已检测 ${index}/${addrs.length}｜做过任务的号数量 ${hasNFTcnt}｜完成 L3 ${finished.length}`;
 
-    chunk.forEach((addr,idx)=>{
-      const id=idCtr-chunk.length+idx;
-      const bal=parseInt(map.get(id)||"0x0",16);
-      const done=bal>=THRESHOLD, todo=done?0:THRESHOLD-bal, pct=Math.min(bal/THRESHOLD,1)*100;
-      const tr=document.createElement("tr"); tr.dataset.balance=bal;
-      if(done){tr.classList.add("done","highlight");finished.push(addr);}
-      tr.innerHTML=`
-        <td>${tbody.rows.length+1}</td>
-        <td style="font-family:Menlo,Consolas,monospace">${addr}</td>
-        <td>${done?"完成":bal}</td>
-        <td>${done?"0":`还差 ${todo}`}</td>
-        <td><div class="pbar"><div style="width:${pct}%"></div></div></td>`;
-      tbody.appendChild(tr); pg.value++;
-    });
+  async function queryOne(addr, rowNum){
+    const body=[{id:1,jsonrpc:"2.0",method:"eth_call",
+      params:[{to:TOKEN,data:SELECTOR+pad64(addr)},"latest"]}];
+    let bal=0;
+    try{
+      const j=await rpc(JSON.stringify(body));
+      bal=parseInt(j[0]?.result||"0x0",16);
+    }catch{}
+    const done=bal>=THRESHOLD, todo=done?0:THRESHOLD-bal, pct=Math.min(bal/THRESHOLD,1)*100;
+    const tr=document.createElement("tr"); tr.dataset.balance=bal;
+    if(done){tr.classList.add("done","highlight");finished.push(addr);}
+    if(bal>0)hasNFTcnt++;
+    tr.innerHTML=`
+      <td>${rowNum}</td>
+      <td style="font-family:Menlo,Consolas,monospace">${addr}</td>
+      <td>${done?"完成":bal}</td>
+      <td>${done?"0":`还差 ${todo}`}</td>
+      <td><div class="pbar"><div style="width:${pct}%"></div></div></td>`;
+    tbody.appendChild(tr);
+    if(table.style.display==="none"){table.style.display="";tabs.style.display="flex";}
+    pg.value=index; updateSummary();
   }
 
-  sum.textContent=`完成 ✔️｜地址 ${valid.length}｜已完成 ${finished.length}`;
-  pgBox.style.display="none";table.style.display="";tabs.style.display="flex";
-  if(finished.length){
-    copyBtn.style.display=""; copyBtn.onclick=()=>{
-      navigator.clipboard.writeText(finished.join("\n")).then(()=>{
-        const t=copyBtn.textContent; copyBtn.textContent="已复制！";
-        setTimeout(()=>copyBtn.textContent=t,1500);
-      });
-    };
-  }
-  btn.disabled=false;
+  /* 顺序轮询 */
+  timer=setInterval(async()=>{
+    if(index>=addrs.length){
+      clearInterval(timer); btn.disabled=false;       // 结束
+      if(finished.length){
+        copyBtn.style.display=""; copyBtn.onclick=()=>{
+          navigator.clipboard.writeText(finished.join("\n"));
+        };
+      }
+      return;
+    }
+    const addr=addrs[index];
+    index++;
+    await queryOne(addr,index);
+  },GAP);
 };
 </script>
 </body>
